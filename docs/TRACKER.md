@@ -292,7 +292,30 @@ real ones — no live MongoDB in this environment so the actual
       from the same IP still returns `400` (not `429`) after the chat
       limit is exhausted, proving the limiter is scoped to `/api/chat`
       only.
-- [ ] README setup instructions finalized
+- [x] README setup instructions finalized — root `README.md` rewritten:
+      prerequisites, all 7 server env vars in a table (`MONGODB_URI`,
+      `GROQ_API_KEY`, `PORT`, `CLIENT_URL`, `JWT_SECRET`, `ADMIN_EMAIL`,
+      `ADMIN_PASSWORD_HASH`) with a working `node -e
+      "require('bcryptjs').hash(...)"` one-liner to generate the password
+      hash, `npm run import-data` usage, how to run server + client
+      locally (including the `PORT=5000` instruction so it actually
+      matches the client's hardcoded Vite proxy target), and admin API
+      `curl` examples. Also an honest "Known limitations" section (Phase
+      4's real-credential checks still unverified, `CLIENT_URL` not
+      wired into CORS yet, the esbuild/Vite audit advisory, no delete on
+      admin `kb_entries`, single-instance-only rate limiting) rather than
+      presenting the project as fully polished. Found a stray garbled
+      line appended to the old `README.md` (looked like tool/editor
+      noise, not real content) — the full rewrite replaced it. Verified:
+      actually ran the documented bcrypt hash command from `server/` and
+      confirmed it produces a real hash.
+
+**Phase 7 complete. All phases done**, with two known open items
+carried forward rather than silently dropped: (1) Phase 4's two
+real-message checks still need a real `GROQ_API_KEY` + `MONGODB_URI` to
+verify (code is written and partially verified, per Phase 4 above); (2)
+the "Known limitations" list in `README.md` — none of these are
+blockers, all are explicitly documented rather than hidden.
 
 ---
 
@@ -411,9 +434,17 @@ real ones — no live MongoDB in this environment so the actual
   documented body + `Retry-After` header; confirmed `/api/admin/login`
   is unaffected from the same IP.
 
+- 2026-07-14 — README finalized: setup instructions, all env vars
+  (including a working bcrypt-hash-generation command, verified by
+  actually running it), `npm run import-data`, running client + server
+  locally with the `PORT=5000` fix so the Vite proxy actually connects,
+  admin API examples, and an explicit "Known limitations" section.
+  **Phase 7 complete — all phases done.**
+
 ---
 
-**Current status:** Rate limiting done. Remaining in Phase 7: README.
-Phase 4 still has unverified real-message checks pending (needs a real
-`GROQ_API_KEY` + `MONGODB_URI` — see Phase 4 above for the exact steps to
-finish it).
+**Current status:** All 7 phases complete. Two things intentionally left
+open rather than silently closed: Phase 4's two real-message
+verification checks still need a real `GROQ_API_KEY` + `MONGODB_URI` to
+run (see Phase 4 above), and `README.md`'s "Known limitations" section
+lists everything else worth knowing before calling this production-ready.
