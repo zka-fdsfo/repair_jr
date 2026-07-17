@@ -1,23 +1,32 @@
 # Architecture
 
+> **Revision note:** the flow below reflects a single retrieve-then-generate
+> design (one MongoDB search + one Groq call per turn), replacing an
+> earlier multi-turn tool-calling loop. See `docs/TRACKER.md` for why.
+
 Client (React chat widget)
-   │  POST /api/chat  { conversationId, message }
+   │  POST /api/chat  { sessionId, message }
    ▼
 Express controller (chat.controller.js)
    │  loads conversation history from MongoDB
-   │  calls groqService.callGroq(history, tools)
+   │  ALWAYS retrieves first: mongoTools.searchKbEntries(message)
+   │  (text-index relevance search, regex fallback — see docs/05)
    ▼
-Groq REST API (openai/gpt-oss-120b) — called via fetch(), no SDK
-   │  model either replies directly, OR requests a tool call
+Retrieved kb_entries documents (or a "nothing found" notice) are injected
+as a system message alongside conversation history
    ▼
-If tool_call requested:
-   server executes it via mongoTools.js (real MongoDB query)
-   result is sent back to Groq as a tool result message
-   Groq is called again and produces the final natural-language reply
+Groq REST API (openai/gpt-oss-120b) — called via fetch(), no SDK, no tools
+   │  generates a reply from the retrieved context only — single call,
+   │  no tool_calls round-trip
    ▼
 Response saved to Conversation doc in MongoDB, returned to client
+(quote populated only when retrieved documents included type:"price" rows)
 
-## Why tool calling instead of manual intent detection
-The model decides when it has enough info to look up a price and when it
-needs to ask another question. We don't hardcode conversation flow — we
-give it tools and a system prompt with rules, and let it drive.
+## Why retrieve-then-generate instead of tool calling
+
+MongoDB is queried directly, every turn, before the model ever runs — the
+model only ever sees data that was actually retrieved, and only generates
+from that. This trades the model's ability to decide *when* to look
+something up (previous design) for a stricter guarantee that a lookup
+always happens and the reply is always grounded in real retrieved
+documents.

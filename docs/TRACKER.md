@@ -443,8 +443,218 @@ blockers, all are explicitly documented rather than hidden.
 
 ---
 
-**Current status:** All 7 phases complete. Two things intentionally left
-open rather than silently closed: Phase 4's two real-message
-verification checks still need a real `GROQ_API_KEY` + `MONGODB_URI` to
-run (see Phase 4 above), and `README.md`'s "Known limitations" section
-lists everything else worth knowing before calling this production-ready.
+## Phase 8 — Retrieval architecture pivot (post-completion)
+
+> After all 7 phases were marked done, explicitly requested: replace the
+> 4-tool Groq tool-calling design with a single "always retrieve from
+> MongoDB first, then one Groq call, generate only from retrieved data"
+> flow. Confirmed as a full replacement (not additive) before starting.
+
+- [x] `server/src/services/mongoTools.js` rewritten — was a 4-function
+      dispatch (`find_brand`/`check_device_serviced`/`get_repair_cost`/
+      `check_problem_serviced`), now a single `searchKbEntries(query)`:
+      tokenizes the message, searches MongoDB's `text` index first
+      (`$text`, sorted by `textScore` — index-backed relevance ranking),
+      falls back to per-token word-boundary regex matching across
+      `text`/`brand`/`model`/`device`/`problem`/`part_type`/`url_path`
+      only if the text search finds nothing. Returns every document tying
+      the top score (keeps multiple price tiers together).
+- [x] `server/src/services/toolDefinitions.js` **deleted** — nothing
+      imports it anymore; left no dead code behind.
+- [x] `server/src/services/groqService.js` — `callGroq(messages, tools)`
+      now only puts `tools`/`tool_choice` in the request body when `tools`
+      is actually passed, so single-shot (no-tools) calls stay valid
+      against the real Groq endpoint.
+- [x] `server/src/controllers/chat.controller.js` rewritten — new system
+      prompt (retrieved docs are the only knowledge source, structured
+      `Device:/Brand:/Model:/Service:/Problem:/Price:/Repair Time:
+      /Warranty:/Notes:` response format, ask-one-follow-up-question and
+      no-match guardrails per the new spec); retrieves via
+      `searchKbEntries` before every Groq call (no tool-call loop, no
+      `MAX_TOOL_ITERATIONS`); `quote` built from retrieved `type:"price"`
+      rows, same shape as before (`{model, problem, options}`) so the
+      client's existing quote card needed no changes.
+- [x] `docs/05-AI-TOOLS-AND-PROMPT-DESIGN.md` and
+      `docs/02-ARCHITECTURE.md` rewritten to describe the new flow
+      (previous tool-calling content is gone, not just appended to —
+      each has a revision note at the top explaining the change).
+
+**Real bug found and fixed during verification** (not just a
+verify-and-report step — this changed the code): simulating retrieval
+against the actual 87-doc dataset surfaced two problems before Groq was
+ever involved:
+1. Unanchored token regexes let short numeric tokens substring-match
+   inside unrelated numbers — `"12"` (from "iPhone 12") matched inside
+   `"120Hz"` (an iPhone 15 Pro Max part-type string), returning a wrong
+   result. Fixed with `\b` word-boundary anchoring in the fallback
+   matcher.
+2. More serious: even after that fix, "iPhone 12 screen" still retrieved
+   iPhone 15 Pro Max price rows (partial token overlap on "iphone" +
+   "screen", zero rows actually containing "12"). Retrieval is
+   deliberately recall-oriented for the *context sent to the LLM* — broad
+   candidates are fine there since the system prompt tells the model to
+   only state retrieved values and ask when ambiguous. But `quote` is
+   built straight from retrieval in code, bypassing the model's judgment
+   entirely — so a wrong-device price could have reached the client
+   regardless of what the reply text said, violating the core "never
+   invent/misattribute a price" rule at the data layer even if the LLM
+   text was careful. Fixed: `buildQuote()` now extracts any numbers in
+   the user's message (almost always a model number) and only returns a
+   quote from a retrieved group whose `model` field actually contains one
+   of them; if the message has numbers but no retrieved price group
+   matches any of them, it returns `null` instead of guessing.
+
+Verified without a live DB or `GROQ_API_KEY` (same limitation as the
+original build): simulated both the text-index-miss fallback path and
+`buildQuote` in-memory against the real dataset —
+"iPhone 15 Pro Max screen replacement" → correct 5-tier quote;
+"iPhone 12 screen" → 9 documents retrieved (reasonable LLM context) but
+`quote: null` (bug fixed, confirmed); "iphone 14 screen repair price"
+(a real but unpriced model) → also correctly `null`; regression-checked
+that `/api/chat` missing-field validation and `/api/health` still work
+after the rewrite; confirmed `callGroq` with no `tools` argument still
+produces a well-formed request against the real Groq endpoint (got the
+expected `401 invalid_api_key`, not a malformed-request error).
+
+**Known residual limitation, not fully solved:** a query with no number
+in it at all (e.g. "how much for an apple screen fix") has nothing to
+gate `buildQuote` on, so it can still surface *a* price group without
+certainty it's the specific device the user meant — the system prompt's
+"ask a follow-up if ambiguous" instruction is the only backstop there,
+and that's unverified without a real `GROQ_API_KEY`. This is a genuine,
+inherent tradeoff of retrieve-before-understand vs. the old design's
+tool-calling loop, where the LLM parsed intent into clean arguments
+*before* any query ran — flagging rather than solving further.
+
+### Post-pivot fix: legacy `role:"tool"` messages broke real Groq calls
+
+The user ran this against a real `GROQ_API_KEY` + `MONGODB_URI` shortly
+after the pivot and hit a real `400` from Groq: `"for 'role:tool' the
+following must be satisfied[('messages.9.tool_call_id' : property
+'tool_call_id' is missing)]"`.
+
+Root cause: their `sessionId`'s `Conversation` document had message
+history from *before* the pivot, back when the app used the tool-calling
+loop — including `role: "tool"` entries and `role: "assistant"` entries
+that were tool-call requests (`content: null`, `tool_calls: [...]`). The
+new `toGroqMessage` maps every stored message to `{role, content}` only,
+which silently drops `tool_call_id` — so old tool-role messages got
+replayed to Groq missing a field Groq requires, and it correctly
+rejected the whole request.
+
+Fixed in `chat.controller.js`: before mapping, `conversation.messages` is
+now filtered to `(role === "user" || role === "assistant") &&
+!m.tool_calls`, dropping any leftover tool-role or tool-call-placeholder
+messages from old sessions without deleting them from history (they stay
+in MongoDB as a record, just aren't replayed to the model anymore).
+Verified: simulated a mixed legacy history (user → assistant+tool_calls →
+tool → assistant → user) through the exact filter+map logic — confirms
+zero `role:"tool"` or tool_calls-bearing messages survive, output is a
+clean, Groq-valid sequence. Regression-checked the app still boots and
+`/api/chat` validation still returns `400` correctly after the fix. This
+is the first real-credential bug report from actual usage — logged here
+per the "never mark done without it actually running" rule, since it
+proves Phase 8's in-memory-only verification, while directionally
+correct, missed a case only a real database with real history could
+surface.
+
+### Follow-up fix: synonym-aware retrieval
+
+Explicitly requested: fix retrieval so differently-worded queries about
+the same thing return the same documents, and gave 4 example queries
+that "must return the same results" — "iPhone 15 Pro Max screen damage
+price" / "...screen repair cost" / "How much is...display replacement?"
+/ "Apple iPhone 15 Pro Max broken screen".
+
+Traced the actual gap empirically (ran all 4 through the real matching
+logic against the real dataset before touching code): the first, second,
+and fourth queries already converged on the correct 5 documents
+(`price-30`..`price-34`, the Screen Damage tiers), because "iphone" +
+"15" + "pro" + "max" alone were strong enough signal. The third
+("display replacement") did **not** converge — it pulled in 10 documents
+including unrelated iPhone 15 Pro Max price rows for *other* problems and
+a device_catalog entry, because "display" and "replacement" never
+literally appear in any stored `text` (only "screen" and
+"damage"/"repair" do), so those tokens contributed zero score and didn't
+distinguish Screen Damage rows from anything else matching just the
+device name.
+
+Fixed in `mongoTools.js`: added `SYNONYM_GROUPS` (screen/display,
+damage/broken/cracked/shattered, repair/replacement/replace/fix,
+price/cost/pricing/quote, plus battery/charging/camera/speaker/water/
+button groups for future-proofing beyond the one problem type in the
+current dataset) and a `synonymRegexFor(token)` helper that expands a
+token to a word-boundary regex covering its whole synonym group before
+either the Mongo query or the in-JS scoring runs. Also **removed** the
+two-tier "$text index first, regex fallback only if empty" design from
+the earlier pivot — plain community `$text` search doesn't know about
+synonyms, so it could produce different (differently-scored) results
+than the regex path depending on which one fired, defeating the actual
+goal. Retrieval is now always the single synonym-aware path.
+
+Verified against the real 87-doc dataset (still no live MongoDB/Groq in
+this environment): all 4 example queries now return the identical
+document set (`price-30`..`price-34`); re-ran the full prior regression
+suite to confirm nothing broke — iPhone 12 screen still correctly yields
+`quote: null` (no wrong-device price), a real unpriced model (iPhone 14)
+still correctly yields `null`, a nonsense query still returns `[]`
+("no information found" path), a brand-only query still finds the brand
+catalog, and a concatenated model query ("iphone15promax screen") still
+retrieves and quotes correctly. Confirmed the real module still imports
+and `/api/chat` validation still returns `400` correctly.
+
+### Follow-up fix: real 413 "request too large" from Groq
+
+Second real-credential bug report: `Groq API error: 413 Payload Too
+Large ... tokens per minute (TPM): Limit 8000, Requested 8677`. Root
+cause was the synonym fix immediately above, which had a side effect:
+generic action/pricing words ("repair", "cost", "price") appear in
+nearly every `type:"price"` document's `text`
+("Repair pricing: ... costs $X"), so once those synonym-expanded, they
+started contributing to *every* price document's relevance score —
+inflating ties well beyond the intended handful of part-type tiers for
+ordinary queries, and the full raw document (including the verbose
+`text` field) was being JSON-dumped into the prompt for every one of
+them.
+
+Three-part fix:
+1. `mongoTools.js` — split `SYNONYM_GROUPS` into `GENERIC_GROUPS`
+   (repair/replacement/fix, price/cost/pricing) and `SPECIFIC_GROUPS`
+   (screen/display, damage/broken/etc., battery, charging, camera,
+   speaker, water, button). Generic terms still widen the MongoDB `$or`
+   for recall, but no longer count toward the relevance score — only
+   falls back to scoring on them if the query is *entirely* generic
+   words with nothing else to go on.
+2. `mongoTools.js` — hard-capped results to `MAX_RESULTS = 15`
+   regardless of how many documents tie for the top score, as a second,
+   independent safety net.
+3. `chat.controller.js` — retrieved documents are now trimmed to
+   structured fields only (`type/brand/device/model/problem/part_type/
+   price/turnover_time/warranty/url_path`) before being sent to Groq —
+   drops `text` (the most token-expensive field, and redundant with the
+   structured fields the system prompt already asks the model to use)
+   and `entryId` (meaningless to the model). Also capped replayed
+   conversation history to the last 10 messages
+   (`HISTORY_LIMIT`), since unbounded history is the other common way a
+   long-running chat blows a per-minute token limit.
+
+Verified against the real dataset: re-ran all 4 synonym-fix example
+queries — still return the identical correct document set. Measured
+payload size before/after the `text`-stripping change: 42-72% smaller
+depending on the query (e.g. the 5-tier iPhone 15 Pro Max Screen Damage
+case: 2235 → 1303 chars). Confirmed a real modules still import and
+`/api/chat` validation still works after the change. Not verified: the
+exact request that produced the original 8677-token error, since the
+triggering message/history isn't available in this environment — but
+the fix addresses the actual mechanism (generic-word score inflation +
+verbose per-doc payload), not just the symptom.
+
+---
+
+**Current status:** All 7 original phases complete, plus Phase 8's
+architecture pivot done and verified as far as this environment allows.
+Three things intentionally left open rather than silently closed:
+(1) Phase 4's original two real-message checks and (2) Phase 8's
+ambiguous-numberless-query case both still need a real `GROQ_API_KEY` +
+`MONGODB_URI` to fully verify; (3) `README.md`'s "Known limitations"
+section for everything else.

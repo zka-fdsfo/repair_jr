@@ -1,9 +1,9 @@
 # RepairBot
 
 AI chatbot for a device repair company (FoneFix). Customers describe their
-device and problem; the bot asks clarifying questions, looks up real
-pricing from MongoDB via tool calls, and quotes a repair cost — it never
-invents a price. Backend calls the Groq REST API directly via `fetch` (no
+device and problem; the bot always searches MongoDB first and generates
+its reply only from what was actually retrieved — it never invents a
+price. Backend calls the Groq REST API directly via `fetch` (no
 `groq-sdk` package).
 
 See [docs/](docs/) for the full design (project overview, architecture,
@@ -13,8 +13,8 @@ on every piece below.
 
 ## Structure
 
-- `server/` — Express API: chat endpoint with Groq tool-calling, admin
-  CRUD for pricing data, MongoDB models
+- `server/` — Express API: chat endpoint (MongoDB retrieval → single Groq
+  call, no tool-calling loop), admin CRUD for pricing data, MongoDB models
 - `client/` — React + Vite chat widget
 - `docs/` — design docs and the progress tracker
 
@@ -97,7 +97,8 @@ Supported: `GET /api/admin/kb-entries` (list, optional `?type=`), `GET /api/admi
 
 ## Known limitations
 
-- The full chat → Groq → tool-call → price flow has not been manually verified end-to-end with real credentials (this was built/tested in an environment with no live `GROQ_API_KEY` or `MONGODB_URI`). Once you're running with real ones, sanity-check both: a serviced + priced combo (e.g. "how much to fix a cracked screen on iPhone 15 Pro Max") should return a real price; a serviced-but-unpriced combo (e.g. "iPhone 12 screen") should get an honest "no price on file, let me connect you to a technician" reply, never an invented number. See `docs/TRACKER.md` Phase 4 for details.
+- The full chat → MongoDB retrieval → Groq → price flow has not been manually verified end-to-end with real credentials (this was built/tested in an environment with no live `GROQ_API_KEY` or `MONGODB_URI`). Once you're running with real ones, sanity-check both: a serviced + priced combo (e.g. "how much to fix a cracked screen on iPhone 15 Pro Max") should return a real price; a serviced-but-unpriced combo (e.g. "iPhone 12 screen") should get an honest "no price on file, let me connect you to a technician" reply, never an invented number. See `docs/TRACKER.md` Phase 4 and Phase 8 for details.
+- Retrieval is recall-oriented and keyword-based, not a full device-model parser. A query with no number in it at all (e.g. "how much for an apple screen fix") can still surface *a* price match without certainty it's the exact device meant — the system prompt's "ask a follow-up if ambiguous" instruction is the only backstop, and that specific behavior hasn't been verified against a real Groq call. Queries that do include a model number (the common case) are protected: the quote shown to the client is gated so it can never present a price for a different model number than what was actually asked about.
 - `CLIENT_URL` is not yet wired into CORS — see the table above.
 - The client's `npm install` reports a moderate esbuild/Vite dev-server advisory; fixing it requires a breaking Vite 5→8 upgrade, not done here.
 - Admin `kb_entries` routes have no delete.

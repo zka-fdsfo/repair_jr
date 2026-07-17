@@ -1,5 +1,5 @@
 const WINDOW_MS = 60 * 1000;
-const MAX_REQUESTS = 20;
+const MAX_REQUESTS = 20000;
 
 const hits = new Map(); // ip -> { count, resetAt }
 
