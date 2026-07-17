@@ -658,3 +658,165 @@ Three things intentionally left open rather than silently closed:
 ambiguous-numberless-query case both still need a real `GROQ_API_KEY` +
 `MONGODB_URI` to fully verify; (3) `README.md`'s "Known limitations"
 section for everything else.
+
+### Follow-up: third real-usage report — "iPhone 15 Pro Max Screen Damage" → "no information in the database"
+
+Third real-credential bug report. Asked for: verify the query targets
+`kb_entries`, search `text` + fields, case-insensitive partial matching
++ relevance ranking, entity extraction, debug logging at every stage,
+and a root-cause fix — not just a report.
+
+**Investigated first, before changing anything:** ran the *exact*
+reported query through the real matching logic against the real 87-doc
+dataset, instrumented with the same logging now added to the actual
+code. Result: retrieval is correct. `KbEntry.find({$or:...})` matches 32
+candidates, scores them, and returns exactly the right 5 documents
+(`price-30`..`price-34`) with a clean top score of 6/6 tokens. This is
+the same conclusion Phase 8 and its follow-up already verified for
+equivalent queries — **could not reproduce a retrieval bug in this
+environment.**
+
+Given that, the most credible remaining explanations are either (a) the
+user's live MongoDB doesn't actually have this data — e.g.
+`npm run import-data` was never run against the same `MONGODB_URI` the
+server connects to — or (b) retrieval succeeds but Groq's reply ignores
+the injected context. (b) had a real, independently-worth-fixing
+candidate cause: the retrieved-context system message was appended
+**after** the full conversation history as a second `system`-role
+message, rather than combined into one leading system message. Chat
+completion APIs generally expect system instructions at the start of the
+array; a system message injected after user/assistant turns isn't
+guaranteed to be weighted as authoritative by every model, and Groq's
+`openai/gpt-oss-120b` may simply under-weight it.
+
+Changes made (all in `mongoTools.js` / `chat.controller.js`):
+1. **Consolidated to one system message.** `SYSTEM_PROMPT +
+   contextBlock` is now a single message at position 0; the trailing
+   second system message is gone.
+2. **Strengthened the prompt wording**: added an explicit "if documents
+   are listed below, you MUST use them — do not say no information was
+   found" instruction directly adjacent to where retrieved documents get
+   injected.
+3. **Real entity extraction** (`extractEntities()`\-\- brand from a known
+   brand list, model from numeric + qualifier tokens like "15 pro max",
+   problem from which specific synonym group(s) matched) — genuinely
+   used for the requested debug output, not a cosmetic addition, though
+   retrieval itself still searches on the full token set (extraction
+   didn't replace the existing token/synonym matching, which was already
+   verified correct).
+4. **Debug logging added end-to-end**, exactly as requested: in
+   `searchKbEntries` — the query, tokens, extracted entities, the
+   MongoDB query shape + regex patterns, candidate count, top score, and
+   final document count/IDs; in `postChat` — sessionId + message, how
+   many documents were retrieved (and their content), the outgoing
+   system message size, and Groq's raw reply. All via plain
+   `console.log`, matching the rest of the codebase (no logger
+   abstraction exists yet — `utils/logger.js` is still an unbuilt stub).
+
+Verified: re-ran the exact failing query ("iPhone 15 Pro Max Screen
+Damage") through the debug-instrumented logic against the real dataset —
+confirms the full pipeline output end-to-end (tokens → entities → query
+→ 32 candidates → top score 6 → 5 correct documents). Confirmed the real
+modules still import and `/api/chat` validation still works.
+
+**Being honest about what's actually fixed vs. diagnosed:** the
+consolidated-system-message change is a real, defensible fix for a
+plausible cause, and the debug logs are exactly what was asked for — but
+without live MongoDB/Groq access in this environment, it wasn't possible
+to confirm which of the two explanations above was the actual cause of
+the reported failure. **Next step for the user:** retry the same query
+and check the server console — the new logs will show directly whether
+MongoDB returned 5 documents (in which case the consolidated-prompt fix
+was the answer) or 0 documents (in which case it's a data/`MONGODB_URI`
+issue — confirm `npm run import-data` was run against the exact same
+connection string the running server uses).
+
+### Follow-up: fourth report — same query, insisted the bug is in retrieval, not the LLM
+
+User pushed back explicitly: don't touch the system prompt, the issue is
+the MongoDB retrieval pipeline, the database already has matching
+documents. Asked for: review the query, review entity extraction, log
+extracted brand/model/service/problem + the MongoDB filter + matched
+documents, search `text` **and every field inside `metadata`**,
+`$regex`+`i` partial matching, no exact-service-name requirement,
+"Screen Damage" must still match "Screen Damage Repair", return every
+option, and show the exact code changes.
+
+**No system prompt changes made this time** — only `mongoTools.js`
+touched.
+
+The explicit ask to "search every field inside `metadata`" was the key
+clue: the raw dataset file (`fonefix_rag_dataset.jsonl`) is shaped
+`{id, text, metadata: {brand, model, problem, price (string!), ...}}` —
+confirmed all 87 lines still use this nested shape
+(`grep -c metadata` → 87). `npm run import-data` flattens this on
+import, and every retrieval query so far has only ever searched the
+**flattened** shape (`doc.brand`, `doc.model`, etc.). If `kb_entries` in
+the user's live database ever ended up with documents in the **raw**
+shape instead — e.g. imported directly via `mongoimport` or Atlas's
+"Import Data" UI rather than through `npm run import-data` — every
+existing query would search field paths (`brand`, `model`, `problem`)
+that simply don't exist on those documents (the real data lives at
+`metadata.brand`, `metadata.model`, etc.), so it would find nothing
+despite the data genuinely being present and genuinely matching. This
+would explain the exact symptom reported: "the database already
+contains matching repair documents" (true) but retrieval finds zero
+(also true, for a shape reason, not a matching-logic reason).
+
+**Exact code changes, all in `server/src/services/mongoTools.js`:**
+
+1. Added `METADATA_SEARCH_FIELDS` (every non-`text` field in
+   `SEARCH_FIELDS`, prefixed `metadata.`) and `ALL_QUERY_FIELDS`
+   (flattened + metadata-prefixed, `text` only once). The MongoDB `$or`
+   is now built from `ALL_QUERY_FIELDS` instead of `SEARCH_FIELDS`, so
+   every regex clause checks both `brand` and `metadata.brand`, both
+   `model` and `metadata.model`, etc. — whichever one a given document
+   actually has.
+2. Added `normalizeDoc(doc)`: resolves `entryId`/`id`,
+   `type`/`metadata.type`, `brand`/`metadata.brand`, ... down to one
+   consistent flattened object, preferring the top-level value if both
+   happen to be present. Also coerces `price` to a real `Number` — the
+   raw shape stores it as a string (`"100.00"`), matching the very first
+   schema example given for this project.
+3. `searchKbEntries` now runs `rawCandidates.map(normalizeDoc)`
+   immediately after the MongoDB query, and all scoring + the returned
+   results use these normalized documents. `chat.controller.js` needed
+   **zero changes** — it already expects flattened fields
+   (`d.type === "price"` in `buildQuote`, etc.), and now always gets
+   them regardless of how the underlying document was actually stored.
+4. Debug logging reworded to match the literal ask: `extracted brand`,
+   `extracted model`, `extracted service/problem` as separate log lines,
+   `MongoDB filter` showing the `$or` clause count and every field
+   searched (now including the `metadata.*` paths), `matched documents`
+   showing the raw MongoDB match count before scoring.
+5. Requirement 7 ("Screen Damage" must match "Screen Damage Repair") and
+   "do not require an exact service name" were already satisfied by the
+   existing word-boundary regex `.test()` approach (partial/substring
+   matching, never string equality) — verified rather than assumed, see
+   below.
+
+**Verified**, three scenarios, all against real data:
+- Flattened shape (what `npm run import-data` actually produces): still
+  5/5 correct documents, unchanged from every prior verification.
+- **Raw nested-`metadata` shape** (the actual 87 lines of
+  `fonefix_rag_dataset.jsonl`, used as-is, un-flattened): now **also**
+  returns the identical 5 correct documents, with `price` correctly
+  coerced to a Number (`100`, not `"100.00"`) and `type` correctly
+  resolved to `"price"` even though it only existed at `metadata.type`.
+  This is the scenario that would have silently returned zero results
+  before this fix.
+- Synthetic document with `problem: "Screen Damage Repair"` — query
+  "iPhone 15 Pro Max Screen Damage" still matches it (word-boundary
+  substring, not exact match), confirming requirement 7.
+
+Confirmed the real module still imports, the app still boots, and
+`/api/chat` validation still returns `400` correctly. `chat.controller.js`
+was not touched — the `SYSTEM_PROMPT` string is byte-for-byte the same
+as before this change.
+
+**Still can't confirm from here** whether the live database actually was
+in the raw/nested shape — that's the one thing only the user's own
+`mongosh`/Atlas UI can check directly (e.g. `db.kb_entries.findOne()`
+and look at whether `brand` is top-level or under `metadata`). But
+retrieval is now correct either way, so the fix should hold regardless
+of which shape the live data turns out to be in.
